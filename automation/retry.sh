@@ -1,13 +1,18 @@
 #!/bin/bash
+set -euo pipefail
+
+# Safe directory resolution
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Source configuration
-source "$(dirname "$0")/config.sh"
+source "${SCRIPT_ROOT}/config.sh"
 
 echo "Retry Manual Tax Automation"
 echo "--------------------------------"
 
 # Default values
 SUFFIX=""
+FORCE=0
 
 # Parse CLI parameters
 while [[ $# -gt 0 ]]; do
@@ -16,8 +21,12 @@ while [[ $# -gt 0 ]]; do
       SUFFIX="$2"
       shift 2
       ;;
+    --force|--yes)
+      FORCE=1
+      shift
+      ;;
     --help)
-      echo "Usage: ./retry.sh --suffix <SUFFIX>"
+      echo "Usage: ./retry.sh --suffix <SUFFIX> [--force]"
       exit 0
       ;;
     *)
@@ -26,6 +35,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ ! -t 0 && $FORCE -eq 0 ]]; then
+  echo "Error: Non-interactive execution without --force is refused."
+  exit 1
+fi
 
 if [[ -z "$SUFFIX" ]]; then
   echo "Error: Missing required parameters."
@@ -37,13 +51,28 @@ fi
 if [[ "${SUFFIX:0:1}" != "_" ]]; then
   SUFFIX="_${SUFFIX}"
 fi
+SUFFIX=$(echo "$SUFFIX" | tr '[:lower:]' '[:upper:]')
+
+if [[ ! "$SUFFIX" =~ ^_MR[0-9]+$ ]]; then
+  echo "Error: Invalid suffix format. Must be like _MR1 or MR1"
+  exit 1
+fi
 
 echo "Parameter Validation Passed:"
 echo "- Suffix   : $SUFFIX"
 echo "--------------------------------"
 
+# Concurrency Lock (if flock is available)
+if command -v flock >/dev/null 2>&1; then
+  exec 9> "/tmp/tax_retry.lock"
+  if ! flock -n 9; then
+    echo "Error: Another instance of this script is already running."
+    exit 1
+  fi
+fi
+
 # Check CSV files in folder 02
-EXEC_CSV_DIR="$(dirname "$0")/${DIR_CSV_EXECUTE}"
+EXEC_CSV_DIR="${SCRIPT_ROOT}/${DIR_CSV_EXECUTE}"
 # Create dir if not exist
 mkdir -p "$EXEC_CSV_DIR"
 
@@ -75,45 +104,63 @@ echo "CSV Preparation Completed:"
 echo "- Converted to UNIX format in-place"
 echo "--------------------------------"
 
+# Confirmation Prompt
+ROW_COUNT=$(($(wc -l < "$CSV_FILE") - 1))
+if [[ $ROW_COUNT -lt 0 ]]; then ROW_COUNT=0; fi
+
+echo "Target Suffix: $SUFFIX"
+echo "Row Count    : $ROW_COUNT"
+if [[ $FORCE -eq 0 ]]; then
+  read -r -p "Type YES to confirm execution: " CONFIRM
+  if [[ "$CONFIRM" != "YES" ]]; then
+    echo "Execution cancelled by operator."
+    exit 0
+  fi
+fi
+
 # 4.1 Execution
-SCRIPT_DIR="$(dirname "$0")/${DIR_SCRIPT}"
-PS_SCRIPT="${SCRIPT_DIR}/v2_tax_retry_production.ps1"
+SCRIPT_DIR="${SCRIPT_ROOT}/${DIR_SCRIPT}"
+BASH_SCRIPT="${SCRIPT_DIR}/tax_retry_production.sh"
 
 echo "Executing Business Logic Script..."
-if command -v pwsh &> /dev/null; then
-  pwsh -File "$PS_SCRIPT" -ManualRetrySuffix "$SUFFIX" -CsvPath "$CSV_FILE"
-elif command -v powershell &> /dev/null; then
-  powershell -File "$PS_SCRIPT" -ManualRetrySuffix "$SUFFIX" -CsvPath "$CSV_FILE"
-else
-  echo "Error: 'pwsh' or 'powershell' not found in PATH."
-  echo "Please install PowerShell Core to run this script."
-  # For testing purposes, we don't exit 1 if this is a CI/CD environment without pwsh, 
-  # but in production, we should.
+if [[ ! -f "$BASH_SCRIPT" ]]; then
+  echo "Error: Business logic script not found at $BASH_SCRIPT"
   exit 1
 fi
+
+set +e # allow script to return non-zero
+bash "$BASH_SCRIPT" --suffix "$SUFFIX" --csv "$CSV_FILE"
 EXEC_EXIT_CODE=$?
+set -e
 
 if [[ $EXEC_EXIT_CODE -ne 0 ]]; then
-  echo "Error: Execution failed with exit code $EXEC_EXIT_CODE"
+  echo "Error: Business logic failed with exit code $EXEC_EXIT_CODE."
+  echo "CSV will NOT be archived."
   exit $EXEC_EXIT_CODE
 fi
 
 # 4.2 Move CSV post-execution
-ARCHIVE_CSV_DIR="$(dirname "$0")/${DIR_CSV_ARCHIVE}"
+ARCHIVE_CSV_DIR="${SCRIPT_ROOT}/${DIR_CSV_ARCHIVE}"
 mkdir -p "$ARCHIVE_CSV_DIR"
 mv "$CSV_FILE" "${ARCHIVE_CSV_DIR}/"
 
 # 4.3 Move logs
-LOG_ARCHIVE_DIR="$(dirname "$0")/${DIR_LOG}"
+LOG_ARCHIVE_DIR="${SCRIPT_ROOT}/${DIR_LOG}"
 mkdir -p "$LOG_ARCHIVE_DIR"
 
-# The PowerShell script writes logs to the current working directory, 
-# or maybe to SCRIPT_DIR depending on where it's run from.
-# Let's move any retry_* logs from both locations just in case.
-mv retry_success*.log "$LOG_ARCHIVE_DIR" 2>/dev/null
-mv retry_failed*.log "$LOG_ARCHIVE_DIR" 2>/dev/null
-mv "${SCRIPT_DIR}"/retry_success*.log "$LOG_ARCHIVE_DIR" 2>/dev/null
-mv "${SCRIPT_DIR}"/retry_failed*.log "$LOG_ARCHIVE_DIR" 2>/dev/null
+# The bash script writes logs to the script root directory.
+# We will move them using a safe glob pattern.
+shopt -s nullglob
+SUCCESS_LOGS=("${SCRIPT_ROOT}"/retry_success*.log)
+FAILED_LOGS=("${SCRIPT_ROOT}"/retry_failed*.log)
+shopt -u nullglob
+
+if [ ${#SUCCESS_LOGS[@]} -gt 0 ]; then
+  mv "${SUCCESS_LOGS[@]}" "$LOG_ARCHIVE_DIR/"
+fi
+if [ ${#FAILED_LOGS[@]} -gt 0 ]; then
+  mv "${FAILED_LOGS[@]}" "$LOG_ARCHIVE_DIR/"
+fi
 
 echo "Routing Completed:"
 echo "- CSV moved to $ARCHIVE_CSV_DIR"
